@@ -1,12 +1,13 @@
 from ast import alias
 import disnake
-from disnake.ext import commands
+from disnake.ext import commands, tasks
 from youtubesearchpython import VideosSearch
 import yt_dlp
 import asyncio
 import nacl
 import threading
 import os
+import time
 
 class Music(commands.Cog):
     def __init__(self, bot):
@@ -16,6 +17,9 @@ class Music(commands.Cog):
         self.music_queue = []
         self.stop_requested = False
         self.download_folder = 'downloads'
+        self.last_played_time = time.time()
+        self.inactivity_check.start()
+        self.text_channels = {}
 
         self.YDL_OPTIONS = {'format': 'bestaudio/best',
                             'outtmpl': os.path.join(self.download_folder, '%(id)s.%(ext)s')}
@@ -28,10 +32,12 @@ class Music(commands.Cog):
      
     def get_yt_audio_url(self, query):
         with yt_dlp.YoutubeDL(self.YDL_OPTIONS) as ydl:
-            print('pobieram')
-
-            info = ydl.extract_info(query, download=True)  # Pobieramy metadane oraz plik
-            print('Pobieranie zakończone')
+            try:
+                info = ydl.extract_info(query, download=True)  # Pobieramy metadane oraz plik
+                
+            except Exception as e:
+                print(f'Wystapil blad podczas pobierania: {e}')
+                return e
 
             # Przygotowanie ścieżki pliku
             file_path = os.path.join(self.download_folder, f"{info['id']}.{info['ext']}")
@@ -44,6 +50,7 @@ class Music(commands.Cog):
             self.is_playing = True
             file_path, title = self.music_queue.pop(0)
             self.file_path = file_path
+            self.last_played_time = time.time()
             voice_client = disnake.utils.get(self.bot.voice_clients, guild=inter.guild)
 
             if voice_client:
@@ -53,7 +60,7 @@ class Music(commands.Cog):
                 audio_source = disnake.FFmpegPCMAudio(file_path)
                 print(f'ODTWARZAM: {self.current_file_path}')
                 voice_client.play(audio_source, after=lambda e: self.after_playing(e, inter, prev))
-                await inter.channel.send(f'Teraz odtwarzam: **{title}**')
+                await self.send_to_text_channel(inter, f"Teraz odtwarzam: **{title}**")
             else:
                 self.is_playing = False
                 self.current_file_path = None
@@ -65,18 +72,28 @@ class Music(commands.Cog):
 
 
     def after_playing(self, error, inter, prev):
-        print(f'PRZEKAZUJE DO USUNIECIA: {prev}')
         if prev:
-            print(f'USUWAMmmmm: {prev}')
             self.remove_file(prev)
 
         if self.stop_requested == False:
             asyncio.run_coroutine_threadsafe(self.play_next(inter), self.bot.loop)
+            return
         else:
             return
+        
+    async def send_to_text_channel(self, inter, message):
+        guild_id = inter.guild.id
+        channel_id = self.text_channels.get(guild_id)
+        if channel_id:
+            channel = (
+            inter.guild.get_channel(channel_id) if channel_id else inter.channel
+        )
+            if channel:
+                await channel.send(message)
+            else:
+                print(f"Nie znaleziono kanału o ID: {channel_id}")
 
     def remove_file(self, file_path):
-        """Funkcja usuwająca plik."""
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -85,13 +102,22 @@ class Music(commands.Cog):
                 print(f"Nie udało się usunąć pliku: {e}")
 
     async def skip_current_song(self, inter):
-        """Pomiń aktualny utwór."""
         voice_client = disnake.utils.get(self.bot.voice_clients, guild=inter.guild)
-        to_delete = self.current_file_path
+        
         if voice_client and voice_client.is_playing():
             # Zatrzymaj bieżący utwór
             voice_client.stop()
-            print("Pomijam aktualny utwór.")
+            #await inter.response.send_message("Pominięto utwór. Odtwarzam następny...", ephemeral=True)
+            await self.send_to_text_channel(inter, "Pominięto utwór. Odtwarzam następny...")
+
+    @tasks.loop(seconds=60)
+    async def inactivity_check(self):
+        # Jeśli od ostatniego odtwarzania minęło 5 minut
+        if self.is_playing == False and (time.time() - self.last_played_time) > 300:
+            voice_client = disnake.utils.get(self.bot.voice_clients, guild=self.bot.guilds[0])
+            if voice_client:
+                await voice_client.disconnect()
+
 
     def download_song_in_background(self, query, inter):
     
@@ -101,15 +127,20 @@ class Music(commands.Cog):
             self.music_queue.append((url, title))  # Dodaj utwór do kolejki
             asyncio.run_coroutine_threadsafe(
                 inter.followup.send(f"Dodano do kolejki: **{title}**"), self.bot.loop
+                
             )
+            
+            
 
             # Jeśli nie jest nic odtwarzane, zacznij odtwarzanie
             if not self.is_playing:
                 asyncio.run_coroutine_threadsafe(self.play_next(inter), self.bot.loop)
         except Exception as e:
             asyncio.run_coroutine_threadsafe(
-                inter.followup.send(f"Nie udało się pobrać utworu: {e}"), self.bot.loop
+                inter.followup.send(f"Nie udało się pobrać utworu, czy napewno podajesz poprawny link?"), self.bot.loop
+                
             )
+            
             
 
     @commands.slash_command(description='Odtwórz utwór')
@@ -118,6 +149,7 @@ class Music(commands.Cog):
 
         if not inter.author.voice:
             await inter.response.send_message("Najpierw musisz dołączyć na kanał głosowy;)")
+
             
             return
         else: 
@@ -135,10 +167,19 @@ class Music(commands.Cog):
             await inter.response.defer()  
             try:
                 threading.Thread(target=self.download_song_in_background, args=(query, inter)).start()
+                
             except Exception as e:
                 print(f'BLAD {e}')
                 await inter.followup.send('Nie udało się pobrać informacji o tytule')
                 return
+            
+    @commands.slash_command(description="Ustaw kanał tekstowy dla powiadomień o muzyce.")
+    async def set_channel(self, inter: disnake.ApplicationCommandInteraction, channel: disnake.TextChannel):
+        # Zapisujemy ID kanału w słowniku
+        print(channel.id)
+        self.text_channels[inter.guild.id] = channel.id
+        await inter.response.send_message(f"Ustawiono kanał tekstowy: {channel.mention}")
+
             
             
 
@@ -148,7 +189,8 @@ class Music(commands.Cog):
             await inter.response.send_message("Kolejka jest pusta!", ephemeral=True)
         else:
             queue_list = '\n'.join([f'{i+1}. {title}' for i, (_, title) in enumerate(self.music_queue)])
-            await inter.response.send_message(f'**Kolejka odtwarzania:**\n{queue_list}')
+            await self.send_to_text_channel(inter, f'**Kolejka odtwarzania:**\n{queue_list}')
+            
 
     @commands.slash_command(description='Pomin se utwor')
     async def skip(self, inter: disnake.ApplicationCommandInteraction):
@@ -203,6 +245,16 @@ class Music(commands.Cog):
         self.is_playing = False
         await voice_client.disconnect()
         await inter.response.send_message("Peace out.")
+
+    @leave.before_invoke
+    async def stop_inactivity_check(self, inter):
+        # Zatrzymanie timera, gdy bot wychodzi z kanału
+        self.inactivity_check.cancel()
+
+    @leave.after_invoke
+    async def restart_inactivity_check(self, inter):
+        # Ponowne uruchomienie timera po ponownym dołączeniu bota
+        self.inactivity_check.start()
 
 
         
