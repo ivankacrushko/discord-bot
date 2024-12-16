@@ -17,5 +17,6 @@ async def on_ready():
 
 bot.load_extension("cogs.ping")
 bot.load_extension("cogs.music")
+bot.load_extension("cogs.poe_trade")
 
 bot.run(os.getenv('TOKEN'))
